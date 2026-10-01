@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
 YouTube Video Uzbek Dubbing Engine
-Powered by yt-dlp, clients5 Google Translate, Edge-TTS, and FFmpeg.
+Powered by yt-dlp, clients5 Google Translate, Edge-TTS CLI, and FFmpeg.
 """
 
 import os
 import sys
 import json
 import re
-import asyncio
 import subprocess
 import urllib.request
 import urllib.parse
 from pathlib import Path
-import edge_tts
 
 class YouTubeDubber:
     def __init__(self, output_dir="/tmp/ytdub"):
@@ -125,10 +123,16 @@ class YouTubeDubber:
 
         return translated_subs
 
-    async def generate_speech_file(self, text: str, out_path: str, voice: str = "uz-UZ-MadinaNeural"):
-        """Generates natural speech MP3 via Microsoft Edge TTS."""
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(out_path)
+    def generate_speech_file(self, text: str, out_path: str, voice: str = "uz-UZ-MadinaNeural") -> bool:
+        """Generates natural speech MP3 via edge-tts CLI (100% thread-safe and asyncio-safe)."""
+        cmd = [
+            "edge-tts",
+            "--voice", voice,
+            "--text", text,
+            "--write-media", out_path
+        ]
+        res = subprocess.run(cmd, capture_output=True)
+        return res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 100
 
     def dub_video(self, url: str, voice: str = "uz-UZ-MadinaNeural", max_duration_sec: int = 180) -> dict:
         """Full pipeline: extract, translate, synthesize audio, and output."""
@@ -145,22 +149,16 @@ class YouTubeDubber:
 
         print("--- 3. Edge-TTS bilan o'zbekcha audio sintezi ---")
         audio_segments = []
-        loop = asyncio.get_event_loop()
         
         for idx, sub in enumerate(translated_subs):
             out_file = self.output_dir / f"seg_{idx:04d}.mp3"
-            try:
-                loop.run_until_complete(
-                    self.generate_speech_file(sub["uz_text"], str(out_file), voice)
-                )
-                if out_file.exists() and out_file.stat().st_size > 100:
-                    audio_segments.append({
-                        "file": str(out_file),
-                        "start": sub["start"],
-                        "uz_text": sub["uz_text"]
-                    })
-            except Exception as e:
-                print(f"TTS error on segment {idx}: {e}")
+            success = self.generate_speech_file(sub["uz_text"], str(out_file), voice)
+            if success:
+                audio_segments.append({
+                    "file": str(out_file),
+                    "start": sub["start"],
+                    "uz_text": sub["uz_text"]
+                })
 
         # Download original video audio
         print("--- 4. Original YouTube audio oqimi ---")

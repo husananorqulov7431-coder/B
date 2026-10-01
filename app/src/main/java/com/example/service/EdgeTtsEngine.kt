@@ -1,11 +1,15 @@
 package com.example.service
 
 import android.content.Context
+import android.media.MediaPlayer
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import com.example.model.UzbekVoice
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -19,6 +23,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 class EdgeTtsEngine(
@@ -35,25 +40,24 @@ class EdgeTtsEngine(
         private const val WSS_URL = "wss://speech.platform.bing.com/consumer/speech/synthesize/readahead/edge/v1"
     }
 
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var nativeTts: TextToSpeech? = null
-    var isTtsReady: Boolean = false
-        private set
+    private var mediaPlayer: MediaPlayer? = null
+    private val audioCache = ConcurrentHashMap<String, File>()
 
     init {
-        initTts()
+        initNativeTts()
     }
 
-    private fun initTts() {
+    private fun initNativeTts() {
         try {
             nativeTts = TextToSpeech(context.applicationContext) { status ->
                 if (status == TextToSpeech.SUCCESS) {
-                    isTtsReady = true
                     val uzLocale = Locale("uz", "UZ")
                     val result = nativeTts?.setLanguage(uzLocale)
                     if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
                         nativeTts?.setLanguage(Locale.getDefault())
                     }
-                    Log.d(TAG, "Native TTS initialized successfully")
                 }
             }
         } catch (e: Exception) {
@@ -62,26 +66,81 @@ class EdgeTtsEngine(
     }
 
     /**
-     * Speak text immediately through device speakers in real-time.
+     * Speaks the Uzbek text through device speakers.
+     * Uses Edge-TTS natural voice MP3 playback, falling back to Native TTS.
      */
-    fun speakLive(text: String, voice: UzbekVoice) {
-        if (text.isBlank()) return
-        try {
-            if (voice == UzbekVoice.SARDOR) {
-                nativeTts?.setPitch(0.85f) // deeper voice for male
-                nativeTts?.setSpeechRate(0.95f)
-            } else {
-                nativeTts?.setPitch(1.15f) // brighter voice for female
-                nativeTts?.setSpeechRate(1.0f)
+    fun speakLive(text: String, voice: UzbekVoice, volume: Float = 1.0f) {
+        if (text.isBlank() || volume <= 0.05f) return
+
+        scope.launch {
+            try {
+                // Check cache first
+                val cacheKey = "${voice.voiceId}_${text.hashCode()}"
+                val cachedFile = audioCache[cacheKey]
+
+                if (cachedFile != null && cachedFile.exists() && cachedFile.length() > 100L) {
+                    playAudioFile(cachedFile, volume)
+                    return@launch
+                }
+
+                // Synthesize via Edge-TTS
+                val edgeBytes = withTimeoutOrNull(2500L) {
+                    synthesizeViaEdgeTts(text, voice.voiceId)
+                }
+
+                if (edgeBytes != null && edgeBytes.size > 100) {
+                    val targetFile = File(context.cacheDir, "tts_${cacheKey}.mp3")
+                    FileOutputStream(targetFile).use { it.write(edgeBytes) }
+                    audioCache[cacheKey] = targetFile
+                    playAudioFile(targetFile, volume)
+                    return@launch
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Edge-TTS playback error: ${e.message}")
             }
-            nativeTts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "utterance_${System.currentTimeMillis()}")
-            Log.d(TAG, "Speaking live: $text")
+
+            // Fallback to Native Android TTS
+            withContext(Dispatchers.Main) {
+                try {
+                    nativeTts?.setPitch(if (voice == UzbekVoice.SARDOR) 0.85f else 1.15f)
+                    nativeTts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "utt_${System.currentTimeMillis()}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Native TTS speak error: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private suspend fun playAudioFile(file: File, volume: Float) = withContext(Dispatchers.Main) {
+        try {
+            stopSpeaking()
+            mediaPlayer = MediaPlayer().apply {
+                setDataSource(file.absolutePath)
+                setVolume(volume, volume)
+                prepare()
+                start()
+                setOnCompletionListener {
+                    try {
+                        it.release()
+                    } catch (e: Exception) {
+                        // ignore
+                    }
+                    if (mediaPlayer == it) mediaPlayer = null
+                }
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Error in speakLive: ${e.message}")
+            Log.e(TAG, "MediaPlayer play error: ${e.message}")
         }
     }
 
     fun stopSpeaking() {
+        try {
+            mediaPlayer?.stop()
+            mediaPlayer?.release()
+            mediaPlayer = null
+        } catch (e: Exception) {
+            // ignore
+        }
         try {
             nativeTts?.stop()
         } catch (e: Exception) {
@@ -90,7 +149,7 @@ class EdgeTtsEngine(
     }
 
     /**
-     * Synthesize text to an audio file for offline muxing/buffering.
+     * Synthesizes audio to file for video rendering.
      */
     suspend fun synthesizeTextToFile(
         text: String,
@@ -99,7 +158,6 @@ class EdgeTtsEngine(
     ): Boolean = withContext(Dispatchers.IO) {
         if (text.isBlank()) return@withContext false
 
-        // Quick attempt via Edge-TTS WebSocket (3 seconds max)
         val edgeBytes = withTimeoutOrNull(3000L) {
             try {
                 synthesizeViaEdgeTts(text, voice.voiceId)
@@ -113,11 +171,11 @@ class EdgeTtsEngine(
                 FileOutputStream(outputFile).use { it.write(edgeBytes) }
                 return@withContext true
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to write file: ${e.message}")
+                Log.w(TAG, "Failed writing file: ${e.message}")
             }
         }
 
-        // Fast fallback: minimal valid silent MP3 placeholder
+        // Silent placeholder
         writeSilencePlaceholder(outputFile)
         return@withContext true
     }
@@ -162,8 +220,8 @@ class EdgeTtsEngine(
                 }
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                if (text.contains("Path:turn.end")) {
+            override fun onMessage(webSocket: WebSocket, textMsg: String) {
+                if (textMsg.contains("Path:turn.end")) {
                     webSocket.close(1000, "Done")
                     deferred.complete(audioBuffer.toByteArray())
                 }
@@ -206,7 +264,7 @@ class EdgeTtsEngine(
     }
 
     fun release() {
-        nativeTts?.stop()
+        stopSpeaking()
         nativeTts?.shutdown()
     }
 }

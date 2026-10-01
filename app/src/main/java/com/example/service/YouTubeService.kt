@@ -14,41 +14,63 @@ import java.util.regex.Pattern
 
 class YouTubeService(
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(3, TimeUnit.SECONDS)
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(4, TimeUnit.SECONDS)
         .build()
 ) {
 
     companion object {
         private const val TAG = "YouTubeService"
 
-        fun extractVideoId(urlOrId: String): String {
+        /**
+         * Safely extracts exact 11-character YouTube video ID.
+         * Returns null if link is invalid or incomplete (e.g. less than 11 characters).
+         */
+        fun extractVideoId(urlOrId: String): String? {
             val trimmed = urlOrId.trim()
-            if (trimmed.length == 11 && !trimmed.contains("/") && !trimmed.contains("?") && !trimmed.contains("=")) {
+            if (trimmed.isBlank()) return null
+
+            // 1. Direct 11-character ID (alphanumeric, -, _)
+            if (trimmed.matches(Regex("^[a-zA-Z0-9_-]{11}$"))) {
                 return trimmed
             }
 
-            val patterns = listOf(
-                "(?:v=|vi=|v%3D|vi%3D)([[a-zA-Z0-9_-]]{11})",
-                "youtu\\.be/([[a-zA-Z0-9_-]]{11})",
-                "youtube\\.com/shorts/([[a-zA-Z0-9_-]]{11})",
-                "youtube\\.com/embed/([[a-zA-Z0-9_-]]{11})",
-                "youtube\\.com/live/([[a-zA-Z0-9_-]]{11})"
-            )
-
-            for (p in patterns) {
-                val matcher = Pattern.compile(p).matcher(trimmed)
-                if (matcher.find()) {
-                    val id = matcher.group(1)
-                    if (!id.isNullOrBlank()) return id
-                }
+            // 2. youtu.be/XXXXXXXXXXX
+            val youtuBeMatcher = Regex("youtu\\.be/([a-zA-Z0-9_-]{11})").find(trimmed)
+            if (youtuBeMatcher != null) {
+                return youtuBeMatcher.groupValues[1]
             }
-            return "dQw4w9WgXcQ" // Reliable fallback
+
+            // 3. youtube.com/watch?v=XXXXXXXXXXX
+            val watchMatcher = Regex("[?&]v=([a-zA-Z0-9_-]{11})").find(trimmed)
+            if (watchMatcher != null) {
+                return watchMatcher.groupValues[1]
+            }
+
+            // 4. youtube.com/shorts/XXXXXXXXXXX
+            val shortsMatcher = Regex("shorts/([a-zA-Z0-9_-]{11})").find(trimmed)
+            if (shortsMatcher != null) {
+                return shortsMatcher.groupValues[1]
+            }
+
+            // 5. youtube.com/embed/XXXXXXXXXXX
+            val embedMatcher = Regex("embed/([a-zA-Z0-9_-]{11})").find(trimmed)
+            if (embedMatcher != null) {
+                return embedMatcher.groupValues[1]
+            }
+
+            // 6. Generic search for any 11-character token preceded by slash or equals
+            val genericMatcher = Regex("[/=]([a-zA-Z0-9_-]{11})(?:[&?]|\$)").find(trimmed)
+            if (genericMatcher != null) {
+                return genericMatcher.groupValues[1]
+            }
+
+            return null
         }
     }
 
     /**
-     * Rapidly fetch subtitles with a strict 4-second timeout to avoid any freezing.
+     * Fetches genuine captions from YouTube without any fake or pre-baked text.
      */
     suspend fun getSubtitles(videoId: String): List<SubtitleItem> = withContext(Dispatchers.IO) {
         val result = withTimeoutOrNull(4000L) {
@@ -56,24 +78,29 @@ class YouTubeService(
         }
 
         if (!result.isNullOrEmpty()) {
+            Log.d(TAG, "Found ${result.size} real subtitles for video: $videoId")
             return@withContext result
         }
 
-        Log.d(TAG, "Using instant generated transcript for video $videoId")
-        return@withContext createFallbackTranscript(videoId)
+        // Return empty if video has no captions (no fake dialogue!)
+        Log.w(TAG, "No timed subtitles found on YouTube for $videoId")
+        return@withContext emptyList()
     }
 
     private fun tryDirectTimedText(videoId: String): List<SubtitleItem> {
         val candidateUrls = listOf(
             "https://www.youtube.com/api/timedtext?v=$videoId&lang=en&fmt=srv3",
-            "https://www.youtube.com/api/timedtext?v=$videoId&lang=en"
+            "https://www.youtube.com/api/timedtext?v=$videoId&lang=en",
+            "https://www.youtube.com/api/timedtext?v=$videoId&lang=en&kind=asr",
+            "https://www.youtube.com/api/timedtext?v=$videoId&lang=ru&fmt=srv3",
+            "https://www.youtube.com/api/timedtext?v=$videoId&lang=ru"
         )
 
         for (url in candidateUrls) {
             try {
                 val request = Request.Builder()
                     .url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                     .build()
                 client.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
@@ -85,7 +112,7 @@ class YouTubeService(
                     }
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Direct timedtext error: ${e.message}")
+                Log.w(TAG, "Timedtext error ($url): ${e.message}")
             }
         }
         return emptyList()
@@ -127,20 +154,60 @@ class YouTubeService(
     }
 
     /**
-     * Batch translate multiple lines at once in a single fast network call.
+     * Translates English/Russian lines into Uzbek in batches using Google Translate API.
      */
     suspend fun batchTranslateToUzbek(lines: List<String>): List<String> = withContext(Dispatchers.IO) {
         if (lines.isEmpty()) return@withContext emptyList()
 
-        val joined = lines.joinToString("\n")
-        try {
-            val encoded = URLEncoder.encode(joined, "UTF-8")
-            val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=uz&dt=t&q=$encoded"
-            val request = Request.Builder()
-                .url(url)
-                .header("User-Agent", "Mozilla/5.0")
-                .build()
+        // Batch in groups of 10 lines
+        val results = mutableListOf<String>()
+        val batches = lines.chunked(10)
 
+        for (batch in batches) {
+            val joined = batch.joinToString("\n")
+            try {
+                val encoded = URLEncoder.encode(joined, "UTF-8")
+                val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=uz&dt=t&q=$encoded"
+                val request = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", "Mozilla/5.0")
+                    .build()
+
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: ""
+                        val json = JSONArray(body)
+                        val sentences = json.getJSONArray(0)
+                        val sb = StringBuilder()
+                        for (i in 0 until sentences.length()) {
+                            sb.append(sentences.getJSONArray(i).getString(0))
+                        }
+                        val translated = sb.toString().split("\n").map { it.trim() }
+                        if (translated.size == batch.size) {
+                            results.addAll(translated)
+                            return@use
+                        }
+                    }
+                    results.addAll(batch)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Batch translation error: ${e.message}")
+                results.addAll(batch)
+            }
+        }
+
+        return@withContext results
+    }
+
+    /**
+     * Translates a single text line into Uzbek.
+     */
+    suspend fun translateSingleToUzbek(text: String): String = withContext(Dispatchers.IO) {
+        if (text.isBlank()) return@withContext ""
+        try {
+            val encoded = URLEncoder.encode(text, "UTF-8")
+            val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=uz&dt=t&q=$encoded"
+            val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
             client.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
                     val body = response.body?.string() ?: ""
@@ -150,35 +217,12 @@ class YouTubeService(
                     for (i in 0 until sentences.length()) {
                         sb.append(sentences.getJSONArray(i).getString(0))
                     }
-                    val translatedLines = sb.toString().split("\n")
-                    if (translatedLines.size == lines.size) {
-                        return@withContext translatedLines.map { it.trim() }
-                    }
+                    return@withContext sb.toString().trim()
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Batch translation failed, using simple translations: ${e.message}")
+            Log.w(TAG, "Single translate failed: ${e.message}")
         }
-
-        // Fallback: return lines as-is or default translations
-        return@withContext lines
-    }
-
-    /**
-     * Fallback transcript for videos without captions.
-     */
-    private fun createFallbackTranscript(videoId: String): List<SubtitleItem> {
-        return listOf(
-            SubtitleItem(1000L, 4000L, "Welcome to this YouTube video!", "Ushbu YouTube videosiga xush kelibsiz!"),
-            SubtitleItem(5500L, 4500L, "Today we demonstrate automatic Uzbek dubbing.", "Bugun biz avtomatik o'zbekcha dublyajni ko'rib chiqamiz."),
-            SubtitleItem(10500L, 5000L, "All audio processing runs directly on your phone.", "Barcha audio ishlov berish to'g'ridan-to'g'ri telefoningizda ishlaydi."),
-            SubtitleItem(16000L, 5000L, "No external cloud servers are needed.", "Hech qanday tashqi bulut serverlari talab qilinmaydi."),
-            SubtitleItem(22000L, 5500L, "Notice how the voice synchronizes with subtitles.", "Ovoz subtitrlar bilan qanday uyg'unlashganiga e'tibor bering."),
-            SubtitleItem(28000L, 5000L, "The first 60 seconds are now streaming live.", "Birinchi 60 soniyalik bo'lak hozirda jonli ijro etilmoqda."),
-            SubtitleItem(34000L, 5500L, "Background progressive processing continues seamlessly.", "Orqa fonda keyingi qismlar uzluksiz tayyorlanmoqda."),
-            SubtitleItem(40500L, 5000L, "Enjoy listening in your native Uzbek language!", "O'z ona tilingiz - o'zbek tilida tomosha qilishdan zavqlaning!"),
-            SubtitleItem(46000L, 6000L, "You can control volume mixer and voice options below.", "Pastda ovoz balandligi va suxandon ovozini o'zgartirishingiz mumkin."),
-            SubtitleItem(53000L, 6500L, "The video dubbing system is fully operational.", "Video dublyaj tizimi to'liq va muvaffaqiyatli ishlamoqda.")
-        )
+        return@withContext text
     }
 }

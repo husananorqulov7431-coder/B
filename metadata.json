@@ -1,0 +1,6 @@
+{
+  "name": "Dublyaj",
+  "description": "YouTube videolarini o'zbek tiliga avtomatik dublyaj va subtitr qiluvchi ilova",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

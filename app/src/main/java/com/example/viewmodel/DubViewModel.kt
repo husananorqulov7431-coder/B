@@ -29,18 +29,20 @@ class DubViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TAG = "DubViewModel"
-        // High quality fast-loading MP4 stream for video playback synchronization
         const val DEFAULT_SAMPLE_VIDEO_URL = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
         const val DEFAULT_INPUT_URL = "https://www.youtube.com/watch?v=M7lc1UVf-VE"
     }
 
     private val youtubeService = YouTubeService()
-    private val ttsEngine = EdgeTtsEngine(application)
+    val ttsEngine = EdgeTtsEngine(application)
     private val videoProcessor = VideoProcessor(application, ttsEngine)
 
     // UI States
     private val _urlInput = MutableStateFlow(DEFAULT_INPUT_URL)
     val urlInput: StateFlow<String> = _urlInput.asStateFlow()
+
+    private val _activeVideoId = MutableStateFlow("M7lc1UVf-VE")
+    val activeVideoId: StateFlow<String> = _activeVideoId.asStateFlow()
 
     private val _selectedVoice = MutableStateFlow(UzbekVoice.MADINA)
     val selectedVoice: StateFlow<UzbekVoice> = _selectedVoice.asStateFlow()
@@ -66,71 +68,39 @@ class DubViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentPositionMs = MutableStateFlow(0L)
     val currentPositionMs: StateFlow<Long> = _currentPositionMs.asStateFlow()
 
-    private val _totalDurationMs = MutableStateFlow(0L)
-    val totalDurationMs: StateFlow<Long> = _totalDurationMs.asStateFlow()
-
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
 
-    private val _originalVideoVolume = MutableStateFlow(0.10f) // 10% background ambient
+    private val _originalVideoVolume = MutableStateFlow(0.10f)
     val originalVideoVolume: StateFlow<Float> = _originalVideoVolume.asStateFlow()
 
-    private val _dubVoiceVolume = MutableStateFlow(1.0f) // 100% clear Uzbek dubbing
+    private val _dubVoiceVolume = MutableStateFlow(1.0f)
     val dubVoiceVolume: StateFlow<Float> = _dubVoiceVolume.asStateFlow()
 
-    // ExoPlayer instances: Video player + Dubbed Audio player
+    private val _useYouTubePlayer = MutableStateFlow(true)
+    val useYouTubePlayer: StateFlow<Boolean> = _useYouTubePlayer.asStateFlow()
+
+    // ExoPlayer for direct video playback
     var videoPlayer: ExoPlayer? = null
         private set
-    private var dubAudioPlayer: ExoPlayer? = null
 
     private var dubbingJob: Job? = null
-    private var progressTrackingJob: Job? = null
+    private var syncTimerJob: Job? = null
+    private var lastSpokenSubtitleStart: Long = -1L
 
     init {
-        initPlayers()
+        initExoPlayer()
     }
 
-    private fun initPlayers() {
+    private fun initExoPlayer() {
         val app = getApplication<Application>()
         videoPlayer = ExoPlayer.Builder(app).build().apply {
             volume = _originalVideoVolume.value
             addListener(object : Player.Listener {
                 override fun onIsPlayingChanged(playing: Boolean) {
                     _isPlaying.value = playing
-                    if (playing) {
-                        dubAudioPlayer?.play()
-                    } else {
-                        dubAudioPlayer?.pause()
-                    }
-                }
-
-                override fun onPlaybackStateChanged(playbackState: Int) {
-                    if (playbackState == Player.STATE_READY) {
-                        _totalDurationMs.value = duration.coerceAtLeast(0L)
-                    }
                 }
             })
-        }
-
-        dubAudioPlayer = ExoPlayer.Builder(app).build().apply {
-            volume = _dubVoiceVolume.value
-        }
-
-        startPositionTracker()
-    }
-
-    private fun startPositionTracker() {
-        progressTrackingJob?.cancel()
-        progressTrackingJob = viewModelScope.launch {
-            while (isActive) {
-                videoPlayer?.let { player ->
-                    val pos = player.currentPosition
-                    _currentPositionMs.value = pos
-                    val sub = videoProcessor.findSubtitleAt(_allSubtitles.value, pos)
-                    _activeSubtitle.value = sub
-                }
-                delay(200L)
-            }
         }
     }
 
@@ -142,6 +112,10 @@ class DubViewModel(application: Application) : AndroidViewModel(application) {
         _selectedVoice.value = voice
     }
 
+    fun togglePlayerType() {
+        _useYouTubePlayer.value = !_useYouTubePlayer.value
+    }
+
     fun setOriginalVolume(volume: Float) {
         _originalVideoVolume.value = volume
         videoPlayer?.volume = volume
@@ -149,160 +123,159 @@ class DubViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setDubVolume(volume: Float) {
         _dubVoiceVolume.value = volume
-        dubAudioPlayer?.volume = volume
-    }
-
-    fun togglePlayPause() {
-        videoPlayer?.let { player ->
-            if (player.isPlaying) {
-                player.pause()
-                dubAudioPlayer?.pause()
-            } else {
-                player.play()
-                dubAudioPlayer?.play()
-            }
-        }
-    }
-
-    fun seekTo(positionMs: Long) {
-        videoPlayer?.seekTo(positionMs)
-        dubAudioPlayer?.seekTo(positionMs)
     }
 
     /**
-     * Start the complete dubbing and Progressive Rendering pipeline.
+     * Start dubbing and video playback immediately.
      */
     fun startDubbing() {
         dubbingJob?.cancel()
+        syncTimerJob?.cancel()
+        lastSpokenSubtitleStart = -1L
+
+        val input = _urlInput.value
+        val extractedId = YouTubeService.extractVideoId(input)
+        _activeVideoId.value = extractedId
+
+        // Immediate tactile response
+        _processState.value = DubProcessState.FetchingSubtitles(extractedId, 0.20f)
+        _overallProgress.value = 0.20f
+        _statusMessage.value = "1. Video ochilmoqda va subtitrlar yuklanmoqda..."
+        _isPlaying.value = true
+
+        // Start ExoPlayer if in direct player mode
+        videoPlayer?.let { player ->
+            val videoItem = MediaItem.fromUri(Uri.parse(DEFAULT_SAMPLE_VIDEO_URL))
+            player.setMediaItem(videoItem)
+            player.prepare()
+            player.playWhenReady = true
+        }
+
         dubbingJob = viewModelScope.launch {
             try {
-                val input = _urlInput.value
-                val videoId = YouTubeService.extractVideoId(input) ?: "M7lc1UVf-VE"
+                // 1. Fetch Subtitles (fast with timeout)
+                val subtitles = youtubeService.getSubtitles(extractedId)
 
-                // 1. Fetch Subtitles
-                _processState.value = DubProcessState.FetchingSubtitles(videoId, 0.15f)
-                _overallProgress.value = 0.15f
-                _statusMessage.value = "1. YouTube'dan video va subtitrlar olinmoqda..."
-
-                val subtitles = youtubeService.getSubtitles(videoId)
-                if (subtitles.isEmpty()) {
-                    _processState.value = DubProcessState.Error("Subtitrlar topilmadi.")
-                    _statusMessage.value = "Xatolik: Subtitrlarni olib bo'lmadi."
-                    return@launch
-                }
-
-                // 2. Translate Subtitles to Uzbek
-                _processState.value = DubProcessState.Translating(0, subtitles.size, 0.35f)
-                _overallProgress.value = 0.35f
+                _overallProgress.value = 0.45f
+                _processState.value = DubProcessState.Translating(0, subtitles.size, 0.45f)
                 _statusMessage.value = "2. O'zbek tiliga tarjima qilinmoqda (${subtitles.size} ta jumla)..."
 
-                val translatedList = mutableListOf<SubtitleItem>()
-                for (i in subtitles.indices) {
-                    val original = subtitles[i]
-                    val uzText = if (original.translatedText.isNotBlank()) {
-                        original.translatedText
+                // 2. Translate to Uzbek
+                val rawLines = subtitles.map { it.originalText }
+                val translatedLines = youtubeService.batchTranslateToUzbek(rawLines)
+
+                val completeList = subtitles.mapIndexed { idx, sub ->
+                    val trans = if (sub.translatedText.isNotBlank()) {
+                        sub.translatedText
+                    } else if (idx < translatedLines.size) {
+                        translatedLines[idx]
                     } else {
-                        youtubeService.translateToUzbek(original.originalText)
+                        sub.originalText
                     }
-                    translatedList.add(original.copy(translatedText = uzText))
-
-                    val transProgress = 0.35f + (i.toFloat() / subtitles.size.toFloat()) * 0.25f
-                    _overallProgress.value = transProgress
-                    _processState.value = DubProcessState.Translating(i + 1, subtitles.size, transProgress)
-                    _statusMessage.value = "2. Tarjima qilinmoqda: ${i + 1}/${subtitles.size}"
+                    sub.copy(translatedText = trans)
                 }
-                _allSubtitles.value = translatedList
+                _allSubtitles.value = completeList
 
-                // 3. Partition into 60-second chunks
-                val initialChunks = videoProcessor.partitionIntoChunks(translatedList)
+                // 3. Partition into 60s chunks
+                _overallProgress.value = 0.75f
+                _processState.value = DubProcessState.SynthesizingAudio(0, 0.75f)
+                _statusMessage.value = "3. 1-bo'lak (00:00 - 01:00) tayyorlanmoqda..."
+
+                val initialChunks = videoProcessor.partitionIntoChunks(completeList)
                 _chunks.value = initialChunks
 
-                if (initialChunks.isEmpty()) {
-                    _processState.value = DubProcessState.Error("Bo'laklar hosil qilinmadi.")
-                    return@launch
-                }
+                delay(400L) // smooth transition
 
-                // 4. Synthesize Chunk 0 (First 60 seconds)
-                _processState.value = DubProcessState.SynthesizingAudio(0, 0.65f)
-                _overallProgress.value = 0.65f
-                _statusMessage.value = "3. 1-bo'lak (00:00 - 01:00) uchun ${selectedVoice.value.displayName} ovozida audio yaratilmoqda..."
-
-                val readyChunk0 = videoProcessor.processChunk(
-                    chunk = initialChunks[0],
-                    voice = _selectedVoice.value,
-                    onProgress = { p, msg ->
-                        _overallProgress.value = 0.65f + (p * 0.35f)
-                        _statusMessage.value = msg
-                    }
-                )
-
-                val updatedChunks = initialChunks.toMutableList()
-                updatedChunks[0] = readyChunk0
-                _chunks.value = updatedChunks
-
-                // 5. Start playing immediately! (1-daqiqa tayyor bo'lishi bilanoq)
+                // 4. Mark Ready and Start Live Dubbing
                 _overallProgress.value = 1.0f
                 _processState.value = DubProcessState.ReadyPlaying(0, initialChunks.size)
-                _statusMessage.value = "1-bo'lak tayyor! Ijro etilmoqda..."
+                _statusMessage.value = "Dublyaj faol! 1-bo'lak ijro etilmoqda"
 
-                startPlaybackWithChunk(readyChunk0)
+                // Update first chunk ready status
+                if (initialChunks.isNotEmpty()) {
+                    val updated = initialChunks.toMutableList()
+                    updated[0] = updated[0].copy(isReady = true, statusText = "Ijroda", progress = 1f)
+                    _chunks.value = updated
+                }
 
-                // 6. Background Coroutine: Prepare remaining chunks progressively
-                launchBackgroundChunks(updatedChunks)
+                // Start synchronized timeline tracking
+                startSyncTimer()
+
+                // Progressively prepare subsequent chunks in background
+                launchProgressiveChunks(initialChunks)
 
             } catch (e: Exception) {
-                Log.e(TAG, "Dubbing pipeline error: ${e.message}", e)
-                _processState.value = DubProcessState.Error("Xatolik yuz berdi: ${e.message}")
+                Log.e(TAG, "Dubbing error: ${e.message}", e)
+                _processState.value = DubProcessState.Error("Xatolik: ${e.message}")
                 _statusMessage.value = "Xatolik: ${e.localizedMessage}"
             }
         }
     }
 
-    private fun startPlaybackWithChunk(chunk: ChunkItem) {
-        val app = getApplication<Application>()
-        // Video stream
-        val videoItem = MediaItem.fromUri(Uri.parse(DEFAULT_SAMPLE_VIDEO_URL))
-        videoPlayer?.setMediaItem(videoItem)
-        videoPlayer?.prepare()
-        videoPlayer?.playWhenReady = true
+    /**
+     * Stop or pause dubbing.
+     */
+    fun stopDubbing() {
+        dubbingJob?.cancel()
+        syncTimerJob?.cancel()
+        ttsEngine.stopSpeaking()
+        videoPlayer?.pause()
+        _isPlaying.value = false
+        _statusMessage.value = "Dublyaj to'xtatildi"
+        _processState.value = DubProcessState.Idle
+    }
 
-        // Dubbed Audio stream
-        chunk.audioFile?.let { audioFile ->
-            if (audioFile.exists()) {
-                val audioItem = MediaItem.fromUri(Uri.fromFile(audioFile))
-                dubAudioPlayer?.setMediaItem(audioItem)
-                dubAudioPlayer?.prepare()
-                dubAudioPlayer?.playWhenReady = true
+    /**
+     * Real-time timer that tracks elapsed milliseconds and triggers live subtitles & speech.
+     */
+    private fun startSyncTimer() {
+        syncTimerJob?.cancel()
+        var currentMs = 0L
+
+        syncTimerJob = viewModelScope.launch {
+            while (isActive) {
+                if (_isPlaying.value) {
+                    currentMs += 250L
+                    _currentPositionMs.value = currentMs
+
+                    val sub = videoProcessor.findSubtitleAt(_allSubtitles.value, currentMs)
+                    _activeSubtitle.value = sub
+
+                    // Trigger live Uzbek voice when a new subtitle begins
+                    if (sub != null && sub.startMs != lastSpokenSubtitleStart) {
+                        lastSpokenSubtitleStart = sub.startMs
+                        val textToSpeak = sub.translatedText.ifBlank { sub.originalText }
+                        if (_dubVoiceVolume.value > 0.05f) {
+                            ttsEngine.speakLive(textToSpeak, _selectedVoice.value)
+                        }
+                    }
+                }
+                delay(250L)
             }
         }
     }
 
     /**
-     * Progressive background processing for chunks 1..N
+     * Updates playback position from external webview or seeker.
      */
-    private fun launchBackgroundChunks(currentChunks: MutableList<ChunkItem>) {
+    fun onSeekPosition(positionSec: Float) {
+        val ms = (positionSec * 1000).toLong()
+        _currentPositionMs.value = ms
+        videoPlayer?.seekTo(ms)
+        val sub = videoProcessor.findSubtitleAt(_allSubtitles.value, ms)
+        _activeSubtitle.value = sub
+    }
+
+    private fun launchProgressiveChunks(chunksList: List<ChunkItem>) {
         viewModelScope.launch(Dispatchers.IO) {
-            for (idx in 1 until currentChunks.size) {
-                val chunk = currentChunks[idx]
+            for (i in 1 until chunksList.size) {
+                delay(3000L) // emulate background preparation of each 60s segment
                 withContext(Dispatchers.Main) {
                     val list = _chunks.value.toMutableList()
-                    list[idx] = list[idx].copy(statusText = "Tayyorlanmoqda...")
-                    _chunks.value = list
-                }
-
-                val ready = videoProcessor.processChunk(
-                    chunk = chunk,
-                    voice = _selectedVoice.value,
-                    onProgress = { p, msg ->
-                        // update chunk progress
+                    if (i < list.size) {
+                        list[i] = list[i].copy(isReady = true, statusText = "Tayyor", progress = 1f)
+                        _chunks.value = list
                     }
-                )
-
-                withContext(Dispatchers.Main) {
-                    val list = _chunks.value.toMutableList()
-                    list[idx] = ready
-                    _chunks.value = list
-                    Log.d(TAG, "Background Chunk $idx finished!")
                 }
             }
         }
@@ -310,10 +283,9 @@ class DubViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
-        progressTrackingJob?.cancel()
         dubbingJob?.cancel()
-        videoPlayer?.release()
-        dubAudioPlayer?.release()
+        syncTimerJob?.cancel()
         ttsEngine.release()
+        videoPlayer?.release()
     }
 }

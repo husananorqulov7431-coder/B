@@ -1,12 +1,14 @@
 package com.example.ui
 
+import android.annotation.SuppressLint
 import android.content.ClipboardManager
 import android.content.Context
-import androidx.compose.animation.AnimatedVisibility
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -31,12 +33,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Subtitles
-import androidx.compose.material.icons.filled.Translate
-import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -85,6 +87,7 @@ import com.example.ui.theme.DarkSurfaceVariant
 import com.example.ui.theme.RedPrimary
 import com.example.viewmodel.DubViewModel
 
+@SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun DubScreen(
     viewModel: DubViewModel,
@@ -92,6 +95,7 @@ fun DubScreen(
 ) {
     val context = LocalContext.current
     val urlInput by viewModel.urlInput.collectAsState()
+    val activeVideoId by viewModel.activeVideoId.collectAsState()
     val selectedVoice by viewModel.selectedVoice.collectAsState()
     val processState by viewModel.processState.collectAsState()
     val overallProgress by viewModel.overallProgress.collectAsState()
@@ -99,6 +103,8 @@ fun DubScreen(
     val chunks by viewModel.chunks.collectAsState()
     val activeSubtitle by viewModel.activeSubtitle.collectAsState()
     val allSubtitles by viewModel.allSubtitles.collectAsState()
+    val isPlaying by viewModel.isPlaying.collectAsState()
+    val useYouTubePlayer by viewModel.useYouTubePlayer.collectAsState()
     val originalVolume by viewModel.originalVideoVolume.collectAsState()
     val dubVolume by viewModel.dubVoiceVolume.collectAsState()
 
@@ -115,50 +121,111 @@ fun DubScreen(
             .background(MaterialTheme.colorScheme.background),
         contentPadding = PaddingValues(bottom = 32.dp)
     ) {
-        // 1. Top Header Bar
+        // 1. Top Header
         item {
-            HeaderBar()
+            HeaderBar(
+                useYouTube = useYouTubePlayer,
+                onTogglePlayer = { viewModel.togglePlayerType() }
+            )
         }
 
-        // 2. Video Player Frame with Live Subtitles Overlay
+        // 2. Video Player (YouTube WebView or ExoPlayer) with Overlay Subtitles
         item {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
+                    .padding(horizontal = 16.dp, vertical = 6.dp)
                     .clip(RoundedCornerShape(16.dp))
                     .border(1.dp, DarkBorder, RoundedCornerShape(16.dp))
                     .aspectRatio(16f / 9f)
                     .background(Color.Black)
             ) {
-                if (viewModel.videoPlayer != null && processState is DubProcessState.ReadyPlaying) {
-                    AndroidView(
-                        factory = { ctx ->
-                            PlayerView(ctx).apply {
-                                player = viewModel.videoPlayer
-                                useController = true
-                            }
-                        },
-                        modifier = Modifier.fillMaxSize()
-                    )
+                if (isPlaying) {
+                    if (useYouTubePlayer) {
+                        // Real YouTube Embed Player
+                        AndroidView(
+                            factory = { ctx ->
+                                WebView(ctx).apply {
+                                    settings.javaScriptEnabled = true
+                                    settings.domStorageEnabled = true
+                                    settings.mediaPlaybackRequiresUserGesture = false
+                                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                                    webChromeClient = WebChromeClient()
+                                    webViewClient = WebViewClient()
+                                    val html = """
+                                        <!DOCTYPE html>
+                                        <html>
+                                        <head>
+                                            <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+                                            <style>
+                                                html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+                                                iframe { width:100%; height:100%; border:none; }
+                                            </style>
+                                        </head>
+                                        <body>
+                                            <iframe src="https://www.youtube.com/embed/$activeVideoId?autoplay=1&enablejsapi=1&playsinline=1"
+                                                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                                                allowfullscreen>
+                                            </iframe>
+                                        </body>
+                                        </html>
+                                    """.trimIndent()
+                                    loadDataWithBaseURL("https://www.youtube.com", html, "text/html", "utf-8", null)
+                                }
+                            },
+                            update = { webView ->
+                                val html = """
+                                    <!DOCTYPE html>
+                                    <html>
+                                    <head>
+                                        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+                                        <style>
+                                            html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+                                            iframe { width:100%; height:100%; border:none; }
+                                        </style>
+                                    </head>
+                                    <body>
+                                        <iframe src="https://www.youtube.com/embed/$activeVideoId?autoplay=1&enablejsapi=1&playsinline=1"
+                                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                                            allowfullscreen>
+                                        </iframe>
+                                    </body>
+                                    </html>
+                                """.trimIndent()
+                                webView.loadDataWithBaseURL("https://www.youtube.com", html, "text/html", "utf-8", null)
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        // ExoPlayer Mode
+                        AndroidView(
+                            factory = { ctx ->
+                                PlayerView(ctx).apply {
+                                    player = viewModel.videoPlayer
+                                    useController = true
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
                 } else {
-                    // Empty / Loading Player Graphic
-                    PlayerPlaceholder(processState, animatedProgress)
+                    // Placeholder when not playing
+                    PlayerPlaceholder(onStart = { viewModel.startDubbing() })
                 }
 
-                // Subtitle Overlay (Cinema style at the lower third)
+                // Subtitle Overlay (Floating Cinema Box)
                 if (activeSubtitle != null) {
                     SubtitleOverlay(
                         subtitle = activeSubtitle!!,
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
-                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .padding(horizontal = 14.dp, vertical = 12.dp)
                     )
                 }
             }
         }
 
-        // 3. Progress Card (Percentage & Current Pipeline Step)
+        // 3. Progress Card
         item {
             ProgressSection(
                 progress = animatedProgress,
@@ -167,35 +234,39 @@ fun DubScreen(
             )
         }
 
-        // 4. 60-second Chunks Indicator (Progressive Rendering)
+        // 4. 60-Second Progressive Chunks Section
         if (chunks.isNotEmpty()) {
             item {
                 ChunkQueueSection(chunks = chunks)
             }
         }
 
-        // 5. YouTube URL Input & Voice Selector
+        // 5. Input, Controls & Instant Start Button
         item {
             InputSection(
                 url = urlInput,
                 onUrlChange = { viewModel.onUrlChange(it) },
                 selectedVoice = selectedVoice,
                 onVoiceChange = { viewModel.onVoiceChange(it) },
+                isPlaying = isPlaying,
                 onPasteClicked = {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                     val clip = clipboard?.primaryClip?.getItemAt(0)?.text?.toString()
                     if (!clip.isNullOrBlank()) {
-                        viewModel.onUrlChange(clip)
+                        viewModel.onUrlChange(clip.trim())
                     }
                 },
                 onStartClicked = {
-                    viewModel.startDubbing()
-                },
-                isLoading = processState !is DubProcessState.Idle && processState !is DubProcessState.ReadyPlaying && processState !is DubProcessState.Error
+                    if (isPlaying) {
+                        viewModel.stopDubbing()
+                    } else {
+                        viewModel.startDubbing()
+                    }
+                }
             )
         }
 
-        // 6. Volume Control Sliders
+        // 6. Volume Mixer Section
         item {
             VolumeControlSection(
                 originalVolume = originalVolume,
@@ -205,13 +276,13 @@ fun DubScreen(
             )
         }
 
-        // 7. Subtitle Drawer toggle
+        // 7. Full Subtitles Transcript Viewer
         if (allSubtitles.isNotEmpty()) {
             item {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
                 ) {
                     Button(
                         onClick = { showSubtitlesList = !showSubtitlesList },
@@ -225,7 +296,7 @@ fun DubScreen(
                         Icon(Icons.Default.Subtitles, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            if (showSubtitlesList) "Subtitrlar ro'yxatini yashirish" else "Barcha subtitrlarni ko'rish (${allSubtitles.size})"
+                            if (showSubtitlesList) "Subtitrlar ro'yxatini yashirish" else "O'zbekcha tarjimalar ro'yxati (${allSubtitles.size} ta)"
                         )
                     }
                 }
@@ -241,11 +312,14 @@ fun DubScreen(
 }
 
 @Composable
-private fun HeaderBar() {
+private fun HeaderBar(
+    useYouTube: Boolean,
+    onTogglePlayer: () -> Unit
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 14.dp),
+            .padding(horizontal = 20.dp, vertical = 12.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -272,33 +346,35 @@ private fun HeaderBar() {
                     color = Color.White
                 )
                 Text(
-                    text = "O'zbekcha AI ovoz & Subtitr",
+                    text = "O'zbekcha Ovoz & Subtitr",
                     style = MaterialTheme.typography.bodySmall,
                     color = AmberAccent
                 )
             }
         }
 
+        // Toggle Player Mode Pill
         Surface(
             shape = RoundedCornerShape(20.dp),
             color = DarkSurfaceVariant,
-            border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder)
+            border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
+            modifier = Modifier.clickable { onTogglePlayer() }
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFF00E676))
+                Icon(
+                    Icons.Default.SwapHoriz,
+                    contentDescription = null,
+                    tint = AmberAccent,
+                    modifier = Modifier.size(14.dp)
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "Edge-TTS Online",
+                    text = if (useYouTube) "YouTube Rejim" else "ExoPlayer Rejim",
                     style = MaterialTheme.typography.labelSmall,
-                    color = Color(0xFFB0B7C6)
+                    color = Color.White
                 )
             }
         }
@@ -306,14 +382,12 @@ private fun HeaderBar() {
 }
 
 @Composable
-private fun PlayerPlaceholder(
-    state: DubProcessState,
-    progress: Float
-) {
+private fun PlayerPlaceholder(onStart: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkSurface),
+            .background(DarkSurface)
+            .clickable { onStart() },
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -321,71 +395,32 @@ private fun PlayerPlaceholder(
             verticalArrangement = Arrangement.Center,
             modifier = Modifier.padding(24.dp)
         ) {
-            when (state) {
-                is DubProcessState.Idle -> {
-                    Icon(
-                        Icons.Default.VideoLibrary,
-                        contentDescription = null,
-                        tint = Color(0xFF6C758A),
-                        modifier = Modifier.size(54.dp)
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Video tayyor emas",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = Color.White
-                    )
-                    Text(
-                        text = "Pastdagi maydonga YouTube havolasini kiritib boshlang",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF8E99AF),
-                        textAlign = TextAlign.Center
-                    )
-                }
-                is DubProcessState.ReadyPlaying -> {
-                    // Handled in AndroidView
-                }
-                is DubProcessState.Error -> {
-                    Text(
-                        text = "Xatolik!",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = RedPrimary
-                    )
-                    Text(
-                        text = state.message,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.White,
-                        textAlign = TextAlign.Center
-                    )
-                }
-                else -> {
-                    // Loading State
-                    Box(
-                        modifier = Modifier
-                            .size(64.dp)
-                            .clip(CircleShape)
-                            .background(DarkSurfaceVariant),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "${(progress * 100).toInt()}%",
-                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                            color = AmberAccent
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Text(
-                        text = "1-bo'lak tayyorlanmoqda...",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.White
-                    )
-                    Text(
-                        text = "1 daqiqa bo'lishi bilan video avtomatik boshlanadi",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF8E99AF)
-                    )
-                }
+            Box(
+                modifier = Modifier
+                    .size(60.dp)
+                    .clip(CircleShape)
+                    .background(RedPrimary),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.PlayArrow,
+                    contentDescription = "Boshlash",
+                    tint = Color.White,
+                    modifier = Modifier.size(36.dp)
+                )
             }
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = "Dublyajni boshlash uchun bosing",
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                color = Color.White
+            )
+            Text(
+                text = "YouTube videosi darhol ochiladi va o'zbekcha ovoz yangraydi",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF8E99AF),
+                textAlign = TextAlign.Center
+            )
         }
     }
 }
@@ -398,8 +433,8 @@ private fun SubtitleOverlay(
     Surface(
         modifier = modifier.animateContentSize(),
         shape = RoundedCornerShape(10.dp),
-        color = Color(0xDC080B11),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0x33FFB800))
+        color = Color(0xEB0A0D14),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0x55FFB800))
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
@@ -409,7 +444,7 @@ private fun SubtitleOverlay(
                 text = subtitle.translatedText.ifBlank { subtitle.originalText },
                 color = AmberAccent,
                 style = MaterialTheme.typography.bodyMedium.copy(
-                    fontWeight = FontWeight.SemiBold,
+                    fontWeight = FontWeight.Bold,
                     fontSize = 15.sp
                 ),
                 textAlign = TextAlign.Center
@@ -417,8 +452,8 @@ private fun SubtitleOverlay(
             if (subtitle.translatedText.isNotBlank() && subtitle.originalText != subtitle.translatedText) {
                 Text(
                     text = subtitle.originalText,
-                    color = Color(0xBBFFFFFF),
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
+                    color = Color(0xAAFFFFFF),
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
                     textAlign = TextAlign.Center,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -442,32 +477,17 @@ private fun ProgressSection(
         shape = RoundedCornerShape(14.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder)
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
+        Column(modifier = Modifier.padding(14.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        when (processState) {
-                            is DubProcessState.FetchingSubtitles -> Icons.Default.Subtitles
-                            is DubProcessState.Translating -> Icons.Default.Translate
-                            is DubProcessState.SynthesizingAudio -> Icons.Default.RecordVoiceOver
-                            is DubProcessState.ReadyPlaying -> Icons.Default.PlayArrow
-                            else -> Icons.Default.Headphones
-                        },
-                        contentDescription = null,
-                        tint = AmberAccent,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Jarayon holati",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = Color.White
-                    )
-                }
+                Text(
+                    text = "Dublyaj holati",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = Color.White
+                )
 
                 Text(
                     text = "${(progress * 100).toInt()}%",
@@ -476,7 +496,7 @@ private fun ProgressSection(
                 )
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             LinearProgressIndicator(
                 progress = { progress },
@@ -518,45 +538,33 @@ private fun ChunkQueueSection(chunks: List<ChunkItem>) {
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(chunks) { chunk ->
-                ChunkPill(chunk = chunk)
-            }
-        }
-    }
-}
-
-@Composable
-private fun ChunkPill(chunk: ChunkItem) {
-    val isReady = chunk.isReady
-    Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = if (isReady) Color(0xFF1B2C1F) else DarkSurfaceVariant,
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            if (isReady) Color(0xFF00E676) else DarkBorder
-        )
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(if (isReady) Color(0xFF00E676) else AmberAccent)
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Column {
-                Text(
-                    text = "${chunk.index + 1}-bo'lak (${chunk.timeLabel})",
-                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                    color = Color.White
-                )
-                Text(
-                    text = chunk.statusText,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                    color = if (isReady) Color(0xFF00E676) else Color(0xFFB0B7C6)
-                )
+                val isReady = chunk.isReady
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (isReady) Color(0xFF1B2C1F) else DarkSurfaceVariant,
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (isReady) Color(0xFF00E676) else DarkBorder
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(if (isReady) Color(0xFF00E676) else AmberAccent)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "${chunk.index + 1}-bo'lak: ${chunk.statusText}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = Color.White
+                        )
+                    }
+                }
             }
         }
     }
@@ -568,21 +576,21 @@ private fun InputSection(
     onUrlChange: (String) -> Unit,
     selectedVoice: UzbekVoice,
     onVoiceChange: (UzbekVoice) -> Unit,
+    isPlaying: Boolean,
     onPasteClicked: () -> Unit,
-    onStartClicked: () -> Unit,
-    isLoading: Boolean
+    onStartClicked: () -> Unit
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
+            .padding(horizontal = 16.dp, vertical = 6.dp),
         colors = CardDefaults.cardColors(containerColor = DarkSurface),
         shape = RoundedCornerShape(16.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                text = "YouTube Video havolasi",
+                text = "YouTube havolasi",
                 style = MaterialTheme.typography.titleSmall,
                 color = Color.White
             )
@@ -633,15 +641,15 @@ private fun InputSection(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 QuickSampleChip(label = "TED Darsi", sampleUrl = "https://www.youtube.com/watch?v=M7lc1UVf-VE", onSelect = onUrlChange)
+                QuickSampleChip(label = "MrBeast", sampleUrl = "https://www.youtube.com/watch?v=0e3GPea1Tyg", onSelect = onUrlChange)
                 QuickSampleChip(label = "Texnologiya", sampleUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ", onSelect = onUrlChange)
-                QuickSampleChip(label = "Shorts", sampleUrl = "https://www.youtube.com/shorts/5O0v5a7wI2I", onSelect = onUrlChange)
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             // Voice Selector
             Text(
-                text = "Dublyaj Ovozi (Edge-TTS):",
+                text = "Dublyaj Ovozi:",
                 style = MaterialTheme.typography.titleSmall,
                 color = Color.White
             )
@@ -659,7 +667,7 @@ private fun InputSection(
                         onClick = { onVoiceChange(voice) },
                         label = {
                             Text(
-                                "${voice.displayName} (${voice.gender} ovoz)",
+                                "${voice.displayName} (${voice.gender})",
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                             )
                         },
@@ -688,32 +696,29 @@ private fun InputSection(
                 }
             }
 
-            Spacer(modifier = Modifier.height(18.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
-            // Main Action Button
+            // Main Action Button (Immediate Touch Reaction)
             Button(
                 onClick = onStartClicked,
-                enabled = !isLoading && url.isNotBlank(),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp)
                     .testTag("start_dubbing_button"),
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = RedPrimary,
-                    contentColor = Color.White,
-                    disabledContainerColor = Color(0xFF4A1E24),
-                    disabledContentColor = Color(0xFF8E99AF)
+                    containerColor = if (isPlaying) Color(0xFF8E0812) else RedPrimary,
+                    contentColor = Color.White
                 )
             ) {
                 Icon(
-                    Icons.Default.PlayArrow,
+                    if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
                     contentDescription = null,
-                    modifier = Modifier.size(22.dp)
+                    modifier = Modifier.size(24.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = if (isLoading) "Dublyaj tayyorlanmoqda..." else "Boshlash (Dublyaj qilish)",
+                    text = if (isPlaying) "Dublyajni to'xtatish" else "Boshlash (Dublyaj qilish)",
                     style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
                 )
             }
@@ -757,7 +762,7 @@ private fun VolumeControlSection(
         shape = RoundedCornerShape(14.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder)
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
+        Column(modifier = Modifier.padding(14.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -771,7 +776,7 @@ private fun VolumeControlSection(
                 )
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             // Original Volume
             Row(
@@ -780,7 +785,7 @@ private fun VolumeControlSection(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Original Video:",
+                    text = "Original Video ovozi:",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color(0xFF8E99AF)
                 )
@@ -808,7 +813,7 @@ private fun VolumeControlSection(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "O'zbekcha Dublyaj:",
+                    text = "O'zbekcha Dublyaj ovozi:",
                     style = MaterialTheme.typography.bodySmall,
                     color = AmberAccent
                 )
